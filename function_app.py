@@ -4,10 +4,16 @@ import tempfile
 import datetime
 import requests
 
+# Configure logging BEFORE importing Azure modules
+logging.getLogger('azure').setLevel(logging.WARNING)
+logging.getLogger('azure.identity').setLevel(logging.WARNING)
+logging.getLogger('azure.core').setLevel(logging.WARNING)
+logging.getLogger('msal').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+
 import azure.functions as func
 from azure.identity import CertificateCredential, ManagedIdentityCredential
 from azure.keyvault.secrets import SecretClient
-from azure.mgmt.resource import ResourceManagementClient
 
 # Create the FunctionApp object (Python v2 model)
 app = func.FunctionApp()
@@ -425,36 +431,10 @@ def _sync_images_to_projects(sharepoint_files: list[dict], access_token: str) ->
         logging.exception("Full exception details:")
 
 
-def _test_call() -> list[str]:
-    """Test Azure auth by listing resource groups or fetching an access token."""
-    try:
-        subscription_id = os.environ.get("AZURE_SUBSCRIPTION_ID")
-        logging.info(f"AZURE_SUBSCRIPTION_ID: {subscription_id if subscription_id else 'NOT SET'}")
-
-        cred = _get_sp_credential()
-
-        if subscription_id:
-            logging.info(f"Testing with ResourceManagementClient for subscription: {subscription_id}")
-            rm = ResourceManagementClient(credential=cred, subscription_id=subscription_id)
-            logging.info("Attempting to list resource groups...")
-            rg_list = [rg.name for rg in rm.resource_groups.list()]
-            logging.info(f"Successfully listed {len(rg_list)} resource groups: {rg_list}")
-            return rg_list
-        else:
-            logging.info("No subscription ID, testing by getting access token...")
-            token = cred.get_token("https://management.azure.com/.default")
-            expiry_time = datetime.datetime.fromtimestamp(token.expires_on)
-            result = f"Token OK, expires {expiry_time.isoformat()}Z"
-            logging.info(f"Token acquisition successful: {result}")
-            return [result]
-    except Exception as e:
-        logging.error(f"Test call failed: {type(e).__name__}: {str(e)}")
-        raise
-
 # --- Function itself ---
 
 @app.timer_trigger(
-    schedule="0 */5 * * * *",   # every 5 minutes (UTC)
+    schedule="0 0 0,12 * * *",  # twice daily at midnight and noon (UTC)
     arg_name="myTimer",
     run_on_startup=True,        # run once on cold start (useful for testing)
     use_monitor=True            # keep track of missed runs
@@ -464,7 +444,7 @@ def beeboard_image_sync(myTimer: func.TimerRequest) -> None:
     logging.info(f"Timer executed at {datetime.datetime.utcnow().isoformat()}Z")
 
     # Log all relevant environment variables (without exposing sensitive values)
-    env_vars = ["KEYVAULT_NAME", "SECRET_NAME", "TENANT_ID", "CLIENT_ID", "AZURE_SUBSCRIPTION_ID"]
+    env_vars = ["KEYVAULT_NAME", "SECRET_NAME", "TENANT_ID", "CLIENT_ID"]
     for var in env_vars:
         value = os.environ.get(var)
         logging.info(f"Environment variable {var}: {'SET' if value else 'NOT SET'}")
@@ -473,10 +453,6 @@ def beeboard_image_sync(myTimer: func.TimerRequest) -> None:
         logging.warning("The timer is past due!")
 
     try:
-        logging.info("Starting authentication test...")
-        result = _test_call()
-        logging.info(f"Auth OK. Test result: {result}")
-
         # Login to DECK API first to get access token
         logging.info("Starting DECK API login...")
         access_token = _login_to_deck()
@@ -493,7 +469,7 @@ def beeboard_image_sync(myTimer: func.TimerRequest) -> None:
             logging.warning("Skipping sync: No SharePoint files or no access token")
 
     except Exception as e:
-        logging.error(f"Auth/Test failed with {type(e).__name__}: {str(e)}")
+        logging.error(f"Auth failed with {type(e).__name__}: {str(e)}")
         logging.exception("Full exception details:")
 
     logging.info("===== Function execution completed =====")

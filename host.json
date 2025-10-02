@@ -6,6 +6,15 @@
         "isEnabled": true,
         "excludedTypes": "Request"
       }
+    },
+    "logLevel": {
+      "default": "Information",
+      "azure": "Warning",
+      "azure.identity": "Warning",
+      "azure.core": "Warning",
+      "azure.core.pipeline.policies.http_logging_policy": "Warning",
+      "msal": "Warning",
+      "urllib3": "Warning"
     }
   },
   "extensionBundle": {
