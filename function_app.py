@@ -131,50 +131,124 @@ def _login_to_deck() -> None:
         raise
 
 
-def _list_sharepoint_lists() -> list[str]:
-    """List all SharePoint lists the service principal can access."""
+def _list_sharepoint_files() -> list[dict]:
+    """List all files in the SharePoint document library with their properties."""
     try:
-        sharepoint_site = os.environ.get("SHAREPOINT_SITE")
+        # Hardcoded SharePoint site and library
+        sharepoint_url = "https://instonegmbh.sharepoint.com.mcas.ms/sites/ProjektbilderFuerAnwendungen/beeboardProjektbilder"
 
-        if not sharepoint_site:
-            logging.warning("SHAREPOINT_SITE environment variable is not set, skipping SharePoint list enumeration")
-            return []
-
-        logging.info(f"Fetching SharePoint lists for site: {sharepoint_site}")
+        logging.info(f"Fetching files from SharePoint document library: {sharepoint_url}")
 
         cred = _get_sp_credential()
 
         # Get access token for Microsoft Graph API
         token = cred.get_token("https://graph.microsoft.com/.default")
 
-        # Make request to Graph API to list all lists in the site
         headers = {
             "Authorization": f"Bearer {token.token}",
             "Accept": "application/json"
         }
 
-        # API endpoint to get lists from a SharePoint site
-        # Format: https://graph.microsoft.com/v1.0/sites/{site-id}/lists
-        url = f"https://graph.microsoft.com/v1.0/sites/{sharepoint_site}/lists"
+        # First, we need to resolve the site ID from the URL
+        # The actual SharePoint hostname without MCAS proxy
+        hostname = "instonegmbh.sharepoint.com"
+        site_path = "/sites/ProjektbilderFuerAnwendungen"
+        library_name = "beeboard-Projektbilder"
 
-        logging.info(f"Making Graph API request to: {url}")
-        response = requests.get(url, headers=headers)
+        # Get the site ID
+        site_url = f"https://graph.microsoft.com/v1.0/sites/{hostname}:{site_path}"
+        logging.info(f"Resolving site ID from: {site_url}")
 
-        if response.status_code == 200:
-            data = response.json()
-            lists = data.get("value", [])
-            list_names = [lst.get("displayName", lst.get("name", "Unknown")) for lst in lists]
-            logging.info(f"Successfully retrieved {len(list_names)} SharePoint lists:")
-            for list_name in list_names:
-                logging.info(f"  - {list_name}")
-            return list_names
-        else:
-            logging.error(f"Failed to retrieve SharePoint lists. Status code: {response.status_code}")
-            logging.error(f"Response: {response.text}")
+        site_response = requests.get(site_url, headers=headers)
+
+        if site_response.status_code != 200:
+            logging.error(f"Failed to resolve site. Status code: {site_response.status_code}")
+            logging.error(f"Response: {site_response.text}")
             return []
 
+        site_data = site_response.json()
+        site_id = site_data.get("id")
+        logging.info(f"Successfully resolved site ID: {site_id}")
+
+        # Get the document library (drive) by name
+        drives_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives"
+        logging.info(f"Fetching drives from: {drives_url}")
+
+        drives_response = requests.get(drives_url, headers=headers)
+
+        if drives_response.status_code != 200:
+            logging.error(f"Failed to get drives. Status code: {drives_response.status_code}")
+            logging.error(f"Response: {drives_response.text}")
+            return []
+
+        drives_data = drives_response.json()
+        drives = drives_data.get("value", [])
+
+        # Find the specific library
+        drive_id = None
+        for drive in drives:
+            if drive.get("name") == library_name:
+                drive_id = drive.get("id")
+                logging.info(f"Found library '{library_name}' with drive ID: {drive_id}")
+                break
+
+        if not drive_id:
+            logging.error(f"Could not find library '{library_name}' in available drives")
+            logging.info(f"Available drives: {[d.get('name') for d in drives]}")
+            return []
+
+        # List all items in the drive with their properties
+        items_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children?$expand=listItem($expand=fields)"
+        logging.info(f"Fetching items from: {items_url}")
+
+        items_response = requests.get(items_url, headers=headers)
+
+        if items_response.status_code != 200:
+            logging.error(f"Failed to get items. Status code: {items_response.status_code}")
+            logging.error(f"Response: {items_response.text}")
+            return []
+
+        items_data = items_response.json()
+        items = items_data.get("value", [])
+
+        logging.info(f"Successfully retrieved {len(items)} items from document library")
+
+        # Process and log each file with its properties
+        files_info = []
+        for item in items:
+            if "file" in item:  # Only process files, not folders
+                file_info = {
+                    "name": item.get("name"),
+                    "id": item.get("id"),
+                    "size": item.get("size"),
+                    "webUrl": item.get("webUrl"),
+                    "createdDateTime": item.get("createdDateTime"),
+                    "lastModifiedDateTime": item.get("lastModifiedDateTime"),
+                }
+
+                # Add custom fields if available
+                if "listItem" in item and "fields" in item["listItem"]:
+                    file_info["customFields"] = item["listItem"]["fields"]
+
+                files_info.append(file_info)
+
+                # Log detailed information
+                logging.info(f"\n--- File: {file_info['name']} ---")
+                logging.info(f"  ID: {file_info['id']}")
+                logging.info(f"  Size: {file_info['size']} bytes")
+                logging.info(f"  Created: {file_info['createdDateTime']}")
+                logging.info(f"  Modified: {file_info['lastModifiedDateTime']}")
+                logging.info(f"  URL: {file_info['webUrl']}")
+
+                if "customFields" in file_info:
+                    logging.info(f"  Custom Properties:")
+                    for key, value in file_info["customFields"].items():
+                        logging.info(f"    {key}: {value}")
+
+        return files_info
+
     except Exception as e:
-        logging.error(f"Failed to list SharePoint lists: {type(e).__name__}: {str(e)}")
+        logging.error(f"Failed to list SharePoint files: {type(e).__name__}: {str(e)}")
         logging.exception("Full exception details:")
         return []
 
@@ -218,7 +292,7 @@ def beeboard_image_sync(myTimer: func.TimerRequest) -> None:
     logging.info(f"Timer executed at {datetime.datetime.utcnow().isoformat()}Z")
 
     # Log all relevant environment variables (without exposing sensitive values)
-    env_vars = ["KEYVAULT_NAME", "SECRET_NAME", "TENANT_ID", "CLIENT_ID", "AZURE_SUBSCRIPTION_ID", "SHAREPOINT_SITE"]
+    env_vars = ["KEYVAULT_NAME", "SECRET_NAME", "TENANT_ID", "CLIENT_ID", "AZURE_SUBSCRIPTION_ID"]
     for var in env_vars:
         value = os.environ.get(var)
         logging.info(f"Environment variable {var}: {'SET' if value else 'NOT SET'}")
@@ -231,9 +305,9 @@ def beeboard_image_sync(myTimer: func.TimerRequest) -> None:
         result = _test_call()
         logging.info(f"Auth OK. Test result: {result}")
 
-        # List SharePoint lists
-        logging.info("Enumerating SharePoint lists...")
-        _list_sharepoint_lists()
+        # List SharePoint files
+        logging.info("Listing files from SharePoint document library...")
+        _list_sharepoint_files()
 
         # If auth test succeeded, try to login to DECK
         logging.info("Starting DECK API login...")
