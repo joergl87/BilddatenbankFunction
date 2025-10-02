@@ -131,6 +131,44 @@ def _login_to_deck() -> None:
         raise
 
 
+def _get_all_items_recursive(drive_id: str, item_id: str, headers: dict, path: str = "") -> list[dict]:
+    """Recursively get all items from a folder and its subfolders."""
+    all_items = []
+
+    # Get children of current folder
+    if item_id == "root":
+        url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children?$expand=listItem($expand=fields)"
+    else:
+        url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/children?$expand=listItem($expand=fields)"
+
+    logging.info(f"Fetching items from path: {path or 'root'}")
+
+    response = requests.get(url, headers=headers)
+
+    if response.status_code != 200:
+        logging.error(f"Failed to get items from {path or 'root'}. Status: {response.status_code}")
+        logging.error(f"Response: {response.text}")
+        return all_items
+
+    data = response.json()
+    items = data.get("value", [])
+
+    for item in items:
+        item_name = item.get("name", "")
+        current_path = f"{path}/{item_name}" if path else item_name
+
+        # Add path to item for tracking
+        item["_fullPath"] = current_path
+        all_items.append(item)
+
+        # If it's a folder, recurse into it
+        if "folder" in item:
+            child_items = _get_all_items_recursive(drive_id, item["id"], headers, current_path)
+            all_items.extend(child_items)
+
+    return all_items
+
+
 def _list_sharepoint_files() -> list[dict]:
     """List all files in the SharePoint document library with their properties."""
     try:
@@ -197,28 +235,26 @@ def _list_sharepoint_files() -> list[dict]:
             logging.info(f"Available drives: {[d.get('name') for d in drives]}")
             return []
 
-        # List all items in the drive with their properties
-        items_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children?$expand=listItem($expand=fields)"
-        logging.info(f"Fetching items from: {items_url}")
+        # Recursively get all items from the library
+        logging.info("Starting recursive fetch of all items...")
+        all_items = _get_all_items_recursive(drive_id, "root", headers)
 
-        items_response = requests.get(items_url, headers=headers)
-
-        if items_response.status_code != 200:
-            logging.error(f"Failed to get items. Status code: {items_response.status_code}")
-            logging.error(f"Response: {items_response.text}")
-            return []
-
-        items_data = items_response.json()
-        items = items_data.get("value", [])
-
-        logging.info(f"Successfully retrieved {len(items)} items from document library")
+        logging.info(f"Successfully retrieved {len(all_items)} total items from document library")
 
         # Process and log each file with its properties
         files_info = []
-        for item in items:
-            if "file" in item:  # Only process files, not folders
+        folder_count = 0
+        file_count = 0
+
+        for item in all_items:
+            if "folder" in item:
+                folder_count += 1
+                logging.info(f"Folder: {item.get('_fullPath')}")
+            elif "file" in item:  # Only process files, not folders
+                file_count += 1
                 file_info = {
                     "name": item.get("name"),
+                    "path": item.get("_fullPath"),
                     "id": item.get("id"),
                     "size": item.get("size"),
                     "webUrl": item.get("webUrl"),
@@ -233,7 +269,8 @@ def _list_sharepoint_files() -> list[dict]:
                 files_info.append(file_info)
 
                 # Log detailed information
-                logging.info(f"\n--- File: {file_info['name']} ---")
+                logging.info(f"\n--- File #{file_count}: {file_info['name']} ---")
+                logging.info(f"  Path: {file_info['path']}")
                 logging.info(f"  ID: {file_info['id']}")
                 logging.info(f"  Size: {file_info['size']} bytes")
                 logging.info(f"  Created: {file_info['createdDateTime']}")
@@ -244,6 +281,8 @@ def _list_sharepoint_files() -> list[dict]:
                     logging.info(f"  Custom Properties:")
                     for key, value in file_info["customFields"].items():
                         logging.info(f"    {key}: {value}")
+
+        logging.info(f"\n=== Summary: Found {file_count} files and {folder_count} folders ===")
 
         return files_info
 
