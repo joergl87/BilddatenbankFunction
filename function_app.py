@@ -80,8 +80,8 @@ def _get_sp_credential() -> CertificateCredential:
         raise
 
 
-def _login_to_deck() -> None:
-    """Login to DECK API using credentials from Key Vault."""
+def _login_to_deck() -> str:
+    """Login to DECK API using credentials from Key Vault. Returns access token."""
     try:
         kv_name = os.environ.get("KEYVAULT_NAME")
 
@@ -119,12 +119,15 @@ def _login_to_deck() -> None:
 
         if response.status_code == 200:
             token_data = response.json()
+            access_token = token_data.get("access_token")
             logging.info(f"Successfully logged in to DECK API. Access token received.")
             if 'expires_in' in token_data:
                 logging.info(f"Token expires in: {token_data['expires_in']} seconds")
+            return access_token
         else:
             logging.error(f"Failed to login to DECK API. Status code: {response.status_code}")
             logging.error(f"Response: {response.text}")
+            raise Exception(f"Failed to login to DECK API: {response.status_code}")
 
     except Exception as e:
         logging.error(f"Failed to login to DECK: {type(e).__name__}: {str(e)}")
@@ -249,7 +252,6 @@ def _list_sharepoint_files() -> list[dict]:
         for item in all_items:
             if "folder" in item:
                 folder_count += 1
-                logging.info(f"Folder: {item.get('_fullPath')}")
             elif "file" in item:  # Only process files, not folders
                 file_count += 1
                 file_info = {
@@ -268,19 +270,10 @@ def _list_sharepoint_files() -> list[dict]:
 
                 files_info.append(file_info)
 
-                # Log detailed information
-                logging.info(f"\n--- File #{file_count}: {file_info['name']} ---")
-                logging.info(f"  Path: {file_info['path']}")
-                logging.info(f"  ID: {file_info['id']}")
-                logging.info(f"  Size: {file_info['size']} bytes")
-                logging.info(f"  Created: {file_info['createdDateTime']}")
-                logging.info(f"  Modified: {file_info['lastModifiedDateTime']}")
-                logging.info(f"  URL: {file_info['webUrl']}")
-
-                if "customFields" in file_info:
-                    logging.info(f"  Custom Properties:")
-                    for key, value in file_info["customFields"].items():
-                        logging.info(f"    {key}: {value}")
+                # Log only essential information
+                projekt_nr = file_info.get("customFields", {}).get("Projektnummer0", "N/A")
+                url = file_info.get("customFields", {}).get("URL", "N/A")
+                logging.info(f"Found: {file_info['name']} | Project: {projekt_nr} | Has URL: {'Yes' if url != 'N/A' else 'No'}")
 
         logging.info(f"\n=== Summary: Found {file_count} files and {folder_count} folders ===")
 
@@ -290,6 +283,146 @@ def _list_sharepoint_files() -> list[dict]:
         logging.error(f"Failed to list SharePoint files: {type(e).__name__}: {str(e)}")
         logging.exception("Full exception details:")
         return []
+
+
+def _fetch_beeboard_projects(access_token: str) -> list[dict]:
+    """Fetch all projects from beeboard API."""
+    try:
+        projects_url = "https://instone.beeboard.eu/gateway/api/v1/projects"
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json"
+        }
+
+        logging.info(f"Fetching projects from beeboard API: {projects_url}")
+
+        response = requests.get(projects_url, headers=headers)
+
+        if response.status_code == 200:
+            projects = response.json()
+            logging.info(f"Successfully fetched {len(projects)} projects from beeboard")
+            return projects
+        else:
+            logging.error(f"Failed to fetch projects. Status code: {response.status_code}")
+            logging.error(f"Response: {response.text}")
+            return []
+
+    except Exception as e:
+        logging.error(f"Failed to fetch beeboard projects: {type(e).__name__}: {str(e)}")
+        logging.exception("Full exception details:")
+        return []
+
+
+def _update_project_image(access_token: str, project_id: str, image_url: str) -> bool:
+    """Update a project's image URL in beeboard."""
+    try:
+        update_url = f"https://instone.beeboard.eu/gateway/api/v1/projects/{project_id}/details"
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "project_image_url": image_url
+        }
+
+        logging.info(f"Updating project {project_id} with image URL: {image_url}")
+
+        response = requests.patch(update_url, json=payload, headers=headers)
+
+        if response.status_code in [200, 204]:
+            logging.info(f"Successfully updated project {project_id}")
+            return True
+        else:
+            logging.error(f"Failed to update project {project_id}. Status code: {response.status_code}")
+            logging.error(f"Response: {response.text}")
+            return False
+
+    except Exception as e:
+        logging.error(f"Failed to update project {project_id}: {type(e).__name__}: {str(e)}")
+        logging.exception("Full exception details:")
+        return False
+
+
+def _sync_images_to_projects(sharepoint_files: list[dict], access_token: str) -> None:
+    """Match SharePoint files with beeboard projects and update project images."""
+    try:
+        # Fetch all projects from beeboard
+        projects = _fetch_beeboard_projects(access_token)
+
+        if not projects:
+            logging.warning("No projects fetched from beeboard, cannot sync images")
+            return
+
+        # Build a mapping of project number -> project
+        project_map = {}
+        for project in projects:
+            project_number = project.get("number")
+            if project_number:
+                project_map[str(project_number)] = project
+            else:
+                logging.debug(f"Skipping project without number: {project.get('id', 'Unknown')}")
+
+        logging.info(f"Built project map with {len(project_map)} projects that have numbers")
+
+        # Match SharePoint files with projects
+        matched_count = 0
+        updated_count = 0
+        skipped_count = 0
+
+        for sp_file in sharepoint_files:
+            file_name = sp_file.get("name", "Unknown")
+            custom_fields = sp_file.get("customFields", {})
+
+            # Get Projektnummer0 and URL from SharePoint
+            projekt_nummer = custom_fields.get("Projektnummer0")
+            image_url = custom_fields.get("URL")
+
+            # Skip if no project number or URL
+            if not projekt_nummer:
+                logging.debug(f"Skipping file {file_name}: No Projektnummer0")
+                skipped_count += 1
+                continue
+
+            if not image_url:
+                logging.debug(f"Skipping file {file_name}: No URL field")
+                skipped_count += 1
+                continue
+
+            # Convert to string for comparison
+            projekt_nummer_str = str(projekt_nummer)
+
+            # Find matching project
+            if projekt_nummer_str in project_map:
+                matched_count += 1
+                project = project_map[projekt_nummer_str]
+                project_id = project.get("id")
+                project_name = project.get("title", "Unknown")
+                current_image_url = project.get("project_image_url", "")
+
+                # Check if the URLs are different
+                if current_image_url == image_url:
+                    logging.info(f"Matched: {projekt_nummer_str} ({project_name}) - already up to date")
+                else:
+                    logging.info(f"Matched: {projekt_nummer_str} ({project_name}) - updating image URL")
+                    # Update the project
+                    success = _update_project_image(access_token, project_id, image_url)
+                    if success:
+                        updated_count += 1
+            else:
+                skipped_count += 1
+
+        logging.info(f"\n=== Sync Summary ===")
+        logging.info(f"Total SharePoint files processed: {len(sharepoint_files)}")
+        logging.info(f"Matched with projects: {matched_count}")
+        logging.info(f"Successfully updated: {updated_count}")
+        logging.info(f"Skipped (no match or missing data): {skipped_count}")
+
+    except Exception as e:
+        logging.error(f"Failed to sync images to projects: {type(e).__name__}: {str(e)}")
+        logging.exception("Full exception details:")
 
 
 def _test_call() -> list[str]:
@@ -344,13 +477,20 @@ def beeboard_image_sync(myTimer: func.TimerRequest) -> None:
         result = _test_call()
         logging.info(f"Auth OK. Test result: {result}")
 
+        # Login to DECK API first to get access token
+        logging.info("Starting DECK API login...")
+        access_token = _login_to_deck()
+
         # List SharePoint files
         logging.info("Listing files from SharePoint document library...")
-        _list_sharepoint_files()
+        sharepoint_files = _list_sharepoint_files()
 
-        # If auth test succeeded, try to login to DECK
-        logging.info("Starting DECK API login...")
-        _login_to_deck()
+        # Sync images to beeboard projects
+        if sharepoint_files and access_token:
+            logging.info("Starting image sync to beeboard projects...")
+            _sync_images_to_projects(sharepoint_files, access_token)
+        else:
+            logging.warning("Skipping sync: No SharePoint files or no access token")
 
     except Exception as e:
         logging.error(f"Auth/Test failed with {type(e).__name__}: {str(e)}")
